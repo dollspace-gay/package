@@ -22,9 +22,15 @@ A comprehensive Jupyter notebook with visual plots demonstrating all major featu
 
 **To run:**
 ```bash
-pip install -e ".[notebooks]"
+# Note: [notebooks] extra is blocked until CVE-2025-53000 is patched
+# Linux/macOS users can use notebooks-hierarchical (vulnerability is Windows-only)
+pip install -e ".[notebooks-hierarchical]"
 jupyter notebook examples/visual_examples.ipynb
 ```
+
+> ⚠️ **Security Note (CVE-2025-53000)**: nbconvert ≤7.16.6 has a Windows code execution
+> vulnerability. Do NOT run `jupyter nbconvert --to pdf` on untrusted notebooks.
+> See: https://github.com/advisories/GHSA-xm59-rqc7-hhvf
 
 ### `formal_validation.py` - Mathematical Validation
 

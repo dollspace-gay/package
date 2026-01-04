@@ -36,11 +36,29 @@ dev = [
     "mypy>=1.0.0",
     "bandit>=1.7.0",
 ]
+# SECURITY: CVE-2025-53000 - nbconvert has Windows code execution vulnerability
+# On Windows, converting notebooks with SVG to PDF executes malicious inkscape.bat
+# from current directory. No patch available as of Jan 2025.
+# See: https://github.com/advisories/GHSA-xm59-rqc7-hhvf
+#
+# notebooks extra BLOCKED until nbconvert releases a fix (>=7.16.7)
+# Use notebooks-hierarchical if you accept the risk on Windows
 notebooks = [
     "jupyter>=1.0.0",
     "matplotlib>=3.5.0",
     "seaborn>=0.11.0",
     "notebook>=6.4.0",
+    "nbconvert>=7.16.7",  # SECURITY: blocks install until CVE-2025-53000 is patched
+]
+# WARNING: This extra installs vulnerable nbconvert. Only use if:
+# 1. You are NOT on Windows, OR
+# 2. You will NOT run `jupyter nbconvert --to pdf` on untrusted notebooks
+notebooks-hierarchical = [
+    "jupyter>=1.0.0",
+    "matplotlib>=3.5.0",
+    "seaborn>=0.11.0",
+    "notebook>=6.4.0",
+    # nbconvert<=7.16.6 has CVE-2025-53000 (Windows code execution)
 ]
 
 [tool.setuptools.packages.find]
