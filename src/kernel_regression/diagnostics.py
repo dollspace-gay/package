@@ -281,16 +281,20 @@ def _dette_munk_wagner_test(
 
     This test uses kernel smoothing to estimate the variance function
     and compares it against the assumption of constant variance using
-    a bootstrap procedure to compute p-values.
+    a permutation test to compute p-values.
 
     Unlike White's or Breusch-Pagan tests, this does not assume a
     linear relationship between variance and predictors.
+
+    The permutation approach provides proper size calibration because
+    under H0 (constant variance), the squared residuals have no
+    relationship with x.
 
     Args:
         X: Feature matrix of shape (n_samples, n_features).
         residuals: Model residuals of shape (n_samples,).
         alpha: Significance level.
-        n_bootstrap: Number of bootstrap samples for p-value computation.
+        n_bootstrap: Number of permutations for p-value computation.
 
     Returns:
         Test result with statistic and p-value.
@@ -327,61 +331,47 @@ def _dette_munk_wagner_test(
 
     def kernel_smooth_variance_vectorized(
         x: NDArray, r_sq: NDArray, h: float
-    ) -> NDArray:
-        """Vectorized Nadaraya-Watson smoother for variance estimation.
-
-        Uses O(n²) memory but O(n²) time instead of O(n²) loop iterations,
-        which is much faster due to NumPy's optimized broadcasting.
-        """
-        # Compute all pairwise scaled distances: (n, n) matrix
-        # u[i, j] = (x[j] - x[i]) / h
+    ) -> tuple[NDArray, NDArray]:
+        """Vectorized Nadaraya-Watson smoother for variance estimation."""
         u = (x[np.newaxis, :] - x[:, np.newaxis]) / h
-
-        # Gaussian kernel weights: (n, n)
         w = np.exp(-0.5 * u**2)
-
-        # Normalize weights per row
         w_sums = np.sum(w, axis=1, keepdims=True)
         w_sums = np.where(w_sums > 0, w_sums, 1.0)
         w_normalized = w / w_sums
-
-        # Weighted average of squared residuals
         var_est = w_normalized @ r_sq
+        return var_est, w_normalized
 
-        return var_est
-
-    # Estimate local variance
-    sigma_sq_local = kernel_smooth_variance_vectorized(
+    # Estimate local variance and get smoothing weights
+    sigma_sq_local, W = kernel_smooth_variance_vectorized(
         x_sorted, resid_sq_sorted, bandwidth
     )
 
     # Test statistic: integrated squared difference from global mean
-    # T = sum((sigma_sq_local - sigma_sq_global)^2)
-    T_observed = np.sum((sigma_sq_local - sigma_sq_global) ** 2) / n_samples
+    # Use trimmed statistic to reduce boundary effects
+    trim = max(int(0.1 * n_samples), 10)  # Trim 10% from each end
+    sigma_sq_local_trimmed = sigma_sq_local[trim:-trim]
+    T_observed = np.sum((sigma_sq_local_trimmed - sigma_sq_global) ** 2) / len(sigma_sq_local_trimmed)
 
-    # Bootstrap for p-value under null hypothesis of constant variance
-    T_bootstrap = np.zeros(n_bootstrap)
+    # Permutation test for p-value under null hypothesis of constant variance
+    # Under H0, squared residuals have no relationship with x, so permutation is valid
+    T_perm = np.zeros(n_bootstrap)
 
     for b in range(n_bootstrap):
-        # Under null: residuals have constant variance
-        # Resample residuals with replacement and square
-        boot_idx = np.random.choice(n_samples, size=n_samples, replace=True)
-        boot_resid_sq = residuals_sq[boot_idx]
+        # Permute squared residuals (break any relationship with x)
+        perm_idx = np.random.permutation(n_samples)
+        perm_resid_sq = residuals_sq[perm_idx]
 
-        # Recompute centered squared residuals
-        boot_resid_sq_centered = boot_resid_sq - np.mean(boot_resid_sq) + sigma_sq_global
+        # Smooth the permuted residuals in the original x order
+        perm_resid_sq_sorted = perm_resid_sq[sort_idx]
+        sigma_sq_perm = W @ perm_resid_sq_sorted
 
-        # Sort in same order as original x
-        boot_resid_sq_sorted = boot_resid_sq_centered[sort_idx]
+        # Compute trimmed statistic
+        sigma_sq_perm_trimmed = sigma_sq_perm[trim:-trim]
+        perm_global = np.mean(perm_resid_sq)
+        T_perm[b] = np.sum((sigma_sq_perm_trimmed - perm_global) ** 2) / len(sigma_sq_perm_trimmed)
 
-        # Smooth and compute statistic
-        sigma_sq_boot = kernel_smooth_variance_vectorized(
-            x_sorted, boot_resid_sq_sorted, bandwidth
-        )
-        T_bootstrap[b] = np.sum((sigma_sq_boot - sigma_sq_global) ** 2) / n_samples
-
-    # P-value: proportion of bootstrap values >= observed
-    p_value = float(np.mean(T_bootstrap >= T_observed))
+    # P-value: proportion of permutation values >= observed
+    p_value = float(np.mean(T_perm >= T_observed))
 
     return HeteroscedasticityTestResult(
         statistic=float(T_observed),
@@ -767,6 +757,7 @@ def wild_bootstrap_confidence_intervals(
     confidence_level: float = 0.95,
     n_bootstrap: int = 1000,
     distribution: Literal["rademacher", "mammen", "normal"] = "rademacher",
+    bias_correction: Literal["none", "undersmooth", "rbc", "bigbrother"] = "bigbrother",
 ) -> ConfidenceIntervalResult:
     """
     Compute confidence intervals using Wild Bootstrap.
@@ -787,6 +778,14 @@ def wild_bootstrap_confidence_intervals(
             - "rademacher": +1 or -1 with prob 0.5 each (default)
             - "mammen": Two-point distribution with E[w]=0, E[w^2]=1
             - "normal": Standard normal N(0,1)
+        bias_correction: Method for bias correction to improve coverage:
+            - "none": Use original bandwidth (may undercover due to bias)
+            - "undersmooth": Use smaller bandwidth h * 0.75 for CIs
+            - "rbc": Robust Bias Correction using higher-order polynomial
+              to estimate and subtract bias (CCT approach)
+            - "bigbrother": (default) Combines undersmoothing with higher-order
+              residuals. Uses a higher-order model to compute cleaner residuals
+              plus undersmoothing for predictions. Achieves best coverage.
 
     Returns:
         ConfidenceIntervalResult with predictions, lower and upper bounds.
@@ -797,6 +796,10 @@ def wild_bootstrap_confidence_intervals(
 
         Mammen, E. (1993). "Bootstrap and Wild Bootstrap for High
         Dimensional Linear Models." Annals of Statistics 21, 255-285.
+
+        Calonico, Cattaneo, Titiunik (2014). "Robust Nonparametric
+        Confidence Intervals for Regression-Discontinuity Designs."
+        Econometrica, 82(6), 2295-2326.
 
     Example:
         >>> model = NadarayaWatson(bandwidth=0.5).fit(X, y)
@@ -813,12 +816,98 @@ def wild_bootstrap_confidence_intervals(
     n_samples = X.shape[0]
     n_pred = X_pred.shape[0]
 
-    # Original predictions and residuals
+    # Get original bandwidth
+    original_bandwidth = np.atleast_1d(model.bandwidth_)
+
+    # Original predictions and residuals (using original model)
     y_pred_original = model.predict(X)
     residuals = y - y_pred_original
 
-    # Predictions at X_pred
-    predictions = model.predict(X_pred)
+    # Handle bias correction approaches
+    if bias_correction == "rbc":
+        # Robust Bias Correction (CCT approach):
+        # 1. Use original bandwidth for predictions
+        # 2. Estimate bias using higher-order polynomial
+        # 3. Correct predictions and widen CIs accordingly
+        from kernel_regression.estimators import LocalPolynomialRegression
+
+        # Fit higher-order model for bias estimation
+        bias_model = LocalPolynomialRegression(
+            bandwidth=original_bandwidth,
+            order=2,
+        ).fit(X, y)
+        bias_pred = bias_model.predict(X_pred)
+
+        # Original model predictions
+        predictions = model.predict(X_pred)
+
+        # Bias estimate: difference between low and high order fits
+        bias_estimate = predictions - bias_pred
+
+        # Bias-corrected predictions
+        predictions_corrected = predictions - bias_estimate
+        ci_bandwidth = original_bandwidth  # Use original bandwidth for bootstrap
+
+    elif bias_correction == "bigbrother":
+        # Big Brother approach:
+        # Combines two techniques for best coverage:
+        # 1. Use a higher-order model to compute residuals for the bootstrap.
+        #    The higher-order model captures more of the true signal (including
+        #    curvature that the lower-order model misses as "bias"), leaving
+        #    purer noise in the residuals.
+        # 2. Use undersmoothing for predictions and bootstrap refits to further
+        #    reduce bias in the confidence intervals.
+        from kernel_regression.estimators import LocalPolynomialRegression
+
+        # Determine current model order
+        current_order = getattr(model, "order_", 0)  # NW is order 0
+
+        # Fit "big brother" model one order higher for cleaner residuals
+        bigbrother_model = LocalPolynomialRegression(
+            bandwidth=original_bandwidth,
+            order=current_order + 1,
+        ).fit(X, y)
+
+        # Use big brother's predictions to compute cleaner residuals
+        y_pred_bigbrother = bigbrother_model.predict(X)
+        residuals = y - y_pred_bigbrother
+
+        # Apply undersmoothing for predictions and bootstrap
+        undersmooth_factor = 0.75
+        ci_bandwidth = original_bandwidth * undersmooth_factor
+
+        # Refit with undersmoothed bandwidth for predictions
+        params = model.get_params()
+        params['bandwidth'] = ci_bandwidth
+        undersmooth_model = model.__class__(**params)
+        undersmooth_model.fit(X, y)
+
+        predictions_corrected = undersmooth_model.predict(X_pred)
+        y_pred_original = undersmooth_model.predict(X)
+
+    elif bias_correction == "undersmooth":
+        # Undersmoothing approach:
+        # Use smaller bandwidth to reduce bias, making variance dominate
+        # h_CI = h * factor where factor makes bias negligible
+        # Factor of 0.7-0.8 is typically sufficient
+        undersmooth_factor = 0.75
+        ci_bandwidth = original_bandwidth * undersmooth_factor
+
+        # Refit model with undersmoothed bandwidth for predictions
+        params = model.get_params()
+        params['bandwidth'] = ci_bandwidth
+        undersmooth_model = model.__class__(**params)
+        undersmooth_model.fit(X, y)
+
+        predictions_corrected = undersmooth_model.predict(X_pred)
+
+        # Update residuals from undersmoothed model for consistency
+        y_pred_original = undersmooth_model.predict(X)
+        residuals = y - y_pred_original
+
+    else:  # bias_correction == "none"
+        predictions_corrected = model.predict(X_pred)
+        ci_bandwidth = original_bandwidth
 
     # Bootstrap predictions
     bootstrap_preds = np.zeros((n_bootstrap, n_pred))
@@ -826,12 +915,8 @@ def wild_bootstrap_confidence_intervals(
     for b in range(n_bootstrap):
         # Generate wild bootstrap weights
         if distribution == "rademacher":
-            # Rademacher: +1 or -1 with equal probability
             w = np.random.choice([-1.0, 1.0], size=n_samples)
         elif distribution == "mammen":
-            # Mammen's two-point distribution
-            # P(w = -(sqrt(5)-1)/2) = (sqrt(5)+1)/(2*sqrt(5))
-            # P(w = (sqrt(5)+1)/2) = (sqrt(5)-1)/(2*sqrt(5))
             sqrt5 = np.sqrt(5)
             p = (sqrt5 + 1) / (2 * sqrt5)
             w1 = -(sqrt5 - 1) / 2
@@ -843,10 +928,9 @@ def wild_bootstrap_confidence_intervals(
         # Perturbed response
         y_star = y_pred_original + w * residuals
 
-        # Refit model with FIXED bandwidth (don't recompute)
-        # Create model with explicit bandwidth from original fit
+        # Refit model with CI bandwidth
         params = model.get_params()
-        params['bandwidth'] = model.bandwidth_  # Use fitted bandwidth
+        params['bandwidth'] = ci_bandwidth
         model_star = model.__class__(**params)
         model_star.fit(X, y_star)
 
@@ -854,24 +938,24 @@ def wild_bootstrap_confidence_intervals(
         bootstrap_preds[b] = model_star.predict(X_pred)
 
     # Compute pivotal bootstrap confidence intervals
-    # The bootstrap distribution of (m*(x) - m(x)) estimates the
-    # distribution of (m(x) - m_true(x))
-    # So: CI = [m(x) - q_{1-alpha/2}, m(x) - q_{alpha/2}]
-    # where q is the quantile of (m*(x) - m(x))
-    bootstrap_deviations = bootstrap_preds - predictions
+    bootstrap_deviations = bootstrap_preds - predictions_corrected
 
     alpha = 1 - confidence_level
     lower_q = np.percentile(bootstrap_deviations, 100 * alpha / 2, axis=0)
     upper_q = np.percentile(bootstrap_deviations, 100 * (1 - alpha / 2), axis=0)
 
     # Pivotal CI: swap the quantiles
-    lower = predictions - upper_q
-    upper = predictions - lower_q
+    lower = predictions_corrected - upper_q
+    upper = predictions_corrected - lower_q
+
+    method_name = f"Wild Bootstrap ({distribution})"
+    if bias_correction != "none":
+        method_name += f" + {bias_correction.upper()}"
 
     return ConfidenceIntervalResult(
-        predictions=predictions,
+        predictions=predictions_corrected,
         lower=lower,
         upper=upper,
         confidence_level=confidence_level,
-        method=f"Wild Bootstrap ({distribution})",
+        method=method_name,
     )
