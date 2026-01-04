@@ -270,6 +270,113 @@ def _goldfeld_quandt_test(
     )
 
 
+def _dette_munk_wagner_test(
+    X: NDArray[np.floating],
+    residuals: NDArray[np.floating],
+    alpha: float,
+    n_bootstrap: int = 500,
+) -> HeteroscedasticityTestResult:
+    """
+    Dette-Munk-Wagner non-parametric test for heteroscedasticity.
+
+    This test uses kernel smoothing to estimate the variance function
+    and compares it against the assumption of constant variance using
+    a bootstrap procedure to compute p-values.
+
+    Unlike White's or Breusch-Pagan tests, this does not assume a
+    linear relationship between variance and predictors.
+
+    Args:
+        X: Feature matrix of shape (n_samples, n_features).
+        residuals: Model residuals of shape (n_samples,).
+        alpha: Significance level.
+        n_bootstrap: Number of bootstrap samples for p-value computation.
+
+    Returns:
+        Test result with statistic and p-value.
+
+    References:
+        Dette, H., Munk, A., & Wagner, T. (1998). "Estimating the variance
+        in nonparametric regression - what is a reasonable choice?"
+        Journal of the Royal Statistical Society: Series B, 60(4), 751-764.
+    """
+    from kernel_regression.bandwidth import silverman_bandwidth
+
+    n_samples = X.shape[0]
+    residuals_sq = residuals ** 2
+
+    # Estimate global variance
+    sigma_sq_global = np.mean(residuals_sq)
+
+    # Use first feature for 1D test, or projected values for multivariate
+    if X.shape[1] == 1:
+        x_order = X.flatten()
+    else:
+        # Project to first principal component
+        X_centered = X - np.mean(X, axis=0)
+        _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
+        x_order = X_centered @ Vt[0]
+
+    # Sort by x
+    sort_idx = np.argsort(x_order)
+    x_sorted = x_order[sort_idx]
+    resid_sq_sorted = residuals_sq[sort_idx]
+
+    # Kernel smooth the squared residuals to get variance estimate
+    bandwidth = silverman_bandwidth(x_sorted.reshape(-1, 1))[0]
+
+    def kernel_smooth_variance(x: NDArray, r_sq: NDArray, h: float) -> NDArray:
+        """Nadaraya-Watson smoother for variance estimation."""
+        n = len(x)
+        var_est = np.zeros(n)
+        for i in range(n):
+            u = (x - x[i]) / h
+            w = np.exp(-0.5 * u**2)  # Gaussian kernel
+            w_sum = np.sum(w)
+            if w_sum > 0:
+                var_est[i] = np.sum(w * r_sq) / w_sum
+            else:
+                var_est[i] = np.mean(r_sq)
+        return var_est
+
+    # Estimate local variance
+    sigma_sq_local = kernel_smooth_variance(x_sorted, resid_sq_sorted, bandwidth)
+
+    # Test statistic: integrated squared difference from global mean
+    # T = sum((sigma_sq_local - sigma_sq_global)^2)
+    T_observed = np.sum((sigma_sq_local - sigma_sq_global) ** 2) / n_samples
+
+    # Bootstrap for p-value under null hypothesis of constant variance
+    T_bootstrap = np.zeros(n_bootstrap)
+
+    for b in range(n_bootstrap):
+        # Under null: residuals have constant variance
+        # Resample residuals with replacement and square
+        boot_idx = np.random.choice(n_samples, size=n_samples, replace=True)
+        boot_resid_sq = residuals_sq[boot_idx]
+
+        # Recompute centered squared residuals
+        boot_resid_sq_centered = boot_resid_sq - np.mean(boot_resid_sq) + sigma_sq_global
+
+        # Sort in same order as original x
+        boot_resid_sq_sorted = boot_resid_sq_centered[sort_idx]
+
+        # Smooth and compute statistic
+        sigma_sq_boot = kernel_smooth_variance(x_sorted, boot_resid_sq_sorted, bandwidth)
+        T_bootstrap[b] = np.sum((sigma_sq_boot - sigma_sq_global) ** 2) / n_samples
+
+    # P-value: proportion of bootstrap values >= observed
+    p_value = float(np.mean(T_bootstrap >= T_observed))
+
+    return HeteroscedasticityTestResult(
+        statistic=float(T_observed),
+        p_value=p_value,
+        is_heteroscedastic=p_value < alpha,
+        test_name="Dette-Munk-Wagner",
+        alpha=alpha,
+    )
+
+
 def residual_diagnostics(
     model: BaseEstimator,
     X: NDArray[np.floating],
@@ -557,3 +664,199 @@ class GoodnessOfFit:
 
     def __str__(self) -> str:
         return self.summary()
+
+    def get_leverage_values(self) -> NDArray[np.floating]:
+        """
+        Compute leverage values (diagonal of the hat matrix).
+
+        The leverage h_ii measures the influence of observation i on its
+        own fitted value. High leverage points have disproportionate
+        influence on the regression fit.
+
+        Returns
+        -------
+        ndarray of shape (n_samples,)
+            Leverage values (diagonal of hat matrix H where y_hat = Hy)
+
+        Notes
+        -----
+        For Nadaraya-Watson regression:
+            h_ii = K(0) / sum_j K((x_i - x_j) / h)
+
+        Leverage values should satisfy:
+        - 0 <= h_ii <= 1
+        - sum(h_ii) = effective degrees of freedom
+        """
+        return _compute_leverage_values(
+            self.X, self.model.X_, self.model.bandwidth_,
+            getattr(self.model, "kernel_func_", get_kernel("gaussian"))
+        )
+
+
+def _compute_leverage_values(
+    X: NDArray[np.floating],
+    X_train: NDArray[np.floating],
+    bandwidth: NDArray[np.floating],
+    kernel_func,
+) -> NDArray[np.floating]:
+    """
+    Compute leverage values (hat matrix diagonal) for kernel regression.
+
+    Args:
+        X: Points to compute leverage at, shape (n_samples, n_features).
+        X_train: Training points, shape (n_train, n_features).
+        bandwidth: Bandwidth per feature, shape (n_features,).
+        kernel_func: Kernel function.
+
+    Returns:
+        Leverage values of shape (n_samples,).
+    """
+    weights = multivariate_kernel_weights(X, X_train, bandwidth, kernel_func)
+    weight_sums = np.sum(weights, axis=1)
+    weight_sums = np.where(weight_sums > 0, weight_sums, 1.0)
+
+    # For points in training set, leverage is self-weight / total weight
+    # For Nadaraya-Watson, self-weight is K(0) for diagonal entries
+    if np.array_equal(X, X_train):
+        leverage = np.diag(weights) / weight_sums
+    else:
+        # For prediction points not in training set
+        leverage = np.max(weights, axis=1) / weight_sums
+
+    return leverage
+
+
+@dataclass
+class ConfidenceIntervalResult:
+    """Result of confidence interval computation."""
+
+    predictions: NDArray[np.floating]
+    lower: NDArray[np.floating]
+    upper: NDArray[np.floating]
+    confidence_level: float
+    method: str
+
+    def __str__(self) -> str:
+        return (
+            f"Confidence Intervals ({self.method})\n"
+            f"  Confidence level: {self.confidence_level:.0%}\n"
+            f"  Mean width: {np.mean(self.upper - self.lower):.4f}"
+        )
+
+
+def wild_bootstrap_confidence_intervals(
+    model: BaseEstimator,
+    X: NDArray[np.floating],
+    y: NDArray[np.floating],
+    X_pred: NDArray[np.floating] | None = None,
+    confidence_level: float = 0.95,
+    n_bootstrap: int = 1000,
+    distribution: Literal["rademacher", "mammen", "normal"] = "rademacher",
+) -> ConfidenceIntervalResult:
+    """
+    Compute confidence intervals using Wild Bootstrap.
+
+    The Wild Bootstrap is robust to heteroscedasticity and non-normality.
+    It perturbs residuals using random weights that preserve the
+    variance structure without assuming a specific error distribution.
+
+    Args:
+        model: Fitted kernel regression model.
+        X: Training features of shape (n_samples, n_features).
+        y: Training targets of shape (n_samples,).
+        X_pred: Points for prediction, shape (n_pred, n_features).
+            If None, uses X.
+        confidence_level: Confidence level (default 0.95 for 95% CI).
+        n_bootstrap: Number of bootstrap samples.
+        distribution: Distribution for wild bootstrap weights:
+            - "rademacher": +1 or -1 with prob 0.5 each (default)
+            - "mammen": Two-point distribution with E[w]=0, E[w^2]=1
+            - "normal": Standard normal N(0,1)
+
+    Returns:
+        ConfidenceIntervalResult with predictions, lower and upper bounds.
+
+    References:
+        Wu, C.F.J. (1986). "Jackknife, Bootstrap and Other Resampling
+        Methods in Regression Analysis." Annals of Statistics 14, 1261-1295.
+
+        Mammen, E. (1993). "Bootstrap and Wild Bootstrap for High
+        Dimensional Linear Models." Annals of Statistics 21, 255-285.
+
+    Example:
+        >>> model = NadarayaWatson(bandwidth=0.5).fit(X, y)
+        >>> ci = wild_bootstrap_confidence_intervals(model, X, y)
+        >>> print(f"95% CI width: {np.mean(ci.upper - ci.lower):.4f}")
+    """
+    X = np.atleast_2d(X)
+    y = np.asarray(y).flatten()
+
+    if X_pred is None:
+        X_pred = X
+
+    X_pred = np.atleast_2d(X_pred)
+    n_samples = X.shape[0]
+    n_pred = X_pred.shape[0]
+
+    # Original predictions and residuals
+    y_pred_original = model.predict(X)
+    residuals = y - y_pred_original
+
+    # Predictions at X_pred
+    predictions = model.predict(X_pred)
+
+    # Bootstrap predictions
+    bootstrap_preds = np.zeros((n_bootstrap, n_pred))
+
+    for b in range(n_bootstrap):
+        # Generate wild bootstrap weights
+        if distribution == "rademacher":
+            # Rademacher: +1 or -1 with equal probability
+            w = np.random.choice([-1.0, 1.0], size=n_samples)
+        elif distribution == "mammen":
+            # Mammen's two-point distribution
+            # P(w = -(sqrt(5)-1)/2) = (sqrt(5)+1)/(2*sqrt(5))
+            # P(w = (sqrt(5)+1)/2) = (sqrt(5)-1)/(2*sqrt(5))
+            sqrt5 = np.sqrt(5)
+            p = (sqrt5 + 1) / (2 * sqrt5)
+            w1 = -(sqrt5 - 1) / 2
+            w2 = (sqrt5 + 1) / 2
+            w = np.where(np.random.random(n_samples) < p, w1, w2)
+        else:  # normal
+            w = np.random.standard_normal(n_samples)
+
+        # Perturbed response
+        y_star = y_pred_original + w * residuals
+
+        # Refit model with FIXED bandwidth (don't recompute)
+        # Create model with explicit bandwidth from original fit
+        params = model.get_params()
+        params['bandwidth'] = model.bandwidth_  # Use fitted bandwidth
+        model_star = model.__class__(**params)
+        model_star.fit(X, y_star)
+
+        # Predict at X_pred
+        bootstrap_preds[b] = model_star.predict(X_pred)
+
+    # Compute pivotal bootstrap confidence intervals
+    # The bootstrap distribution of (m*(x) - m(x)) estimates the
+    # distribution of (m(x) - m_true(x))
+    # So: CI = [m(x) - q_{1-alpha/2}, m(x) - q_{alpha/2}]
+    # where q is the quantile of (m*(x) - m(x))
+    bootstrap_deviations = bootstrap_preds - predictions
+
+    alpha = 1 - confidence_level
+    lower_q = np.percentile(bootstrap_deviations, 100 * alpha / 2, axis=0)
+    upper_q = np.percentile(bootstrap_deviations, 100 * (1 - alpha / 2), axis=0)
+
+    # Pivotal CI: swap the quantiles
+    lower = predictions - upper_q
+    upper = predictions - lower_q
+
+    return ConfidenceIntervalResult(
+        predictions=predictions,
+        lower=lower,
+        upper=upper,
+        confidence_level=confidence_level,
+        method=f"Wild Bootstrap ({distribution})",
+    )
