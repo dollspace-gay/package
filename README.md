@@ -343,6 +343,29 @@ Current status: **244 passed**, 2 skipped
 
 ## Examples
 
+### Visual Examples Notebook
+
+For comprehensive visual examples with plots and detailed explanations, see the Jupyter notebook:
+
+**[examples/visual_examples.ipynb](examples/visual_examples.ipynb)**
+
+The notebook covers:
+- Basic Nadaraya-Watson regression
+- Local polynomial regression with different orders
+- Boundary bias comparison
+- Bandwidth selection and bias-variance tradeoff
+- Per-dimension bandwidth (variable selection)
+- Heteroscedasticity detection
+- Wild bootstrap confidence intervals
+- Goodness of fit diagnostics
+- 2D regression visualization
+
+To run the notebook:
+```bash
+pip install -e ".[notebooks]"
+jupyter notebook examples/visual_examples.ipynb
+```
+
 ### Detecting Heteroscedasticity
 
 ```python
